@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.translator-cache/
+*.js.map
