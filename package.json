@@ -1,6 +1,6 @@
 {
   "name": "jsonai-translator",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "description": "Translate JSON locale files into multiple languages using AI providers",
   "type": "module",
   "main": "./dist/index.cjs",
