@@ -1,5 +1,5 @@
 {
-  "name": "json-locale-translator",
+  "name": "jsonai-translator",
   "version": "0.1.0",
   "description": "Translate JSON locale files into multiple languages using AI providers",
   "type": "module",
