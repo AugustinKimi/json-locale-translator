@@ -1,5 +1,8 @@
 import type { TranslationProvider } from "./base.js";
 import type { ProviderConfig } from "./base.js";
+import { retryWithBackoff } from "../retry.js";
+import type { RetryOptions } from "../retry.js";
+import { RateLimiter } from "../rate-limiter.js";
 
 /** Strip optional markdown code-fence wrapper the model sometimes adds. */
 function extractJson(raw: string): string {
@@ -8,7 +11,15 @@ function extractJson(raw: string): string {
 }
 
 export class AnthropicProvider implements TranslationProvider {
-  constructor(private config: ProviderConfig) {}
+  private readonly _rateLimiter: RateLimiter;
+
+  constructor(
+    private config: ProviderConfig,
+    /** Injectable delay function for tests — omit in production. */
+    private _delayFn?: RetryOptions["delayFn"],
+  ) {
+    this._rateLimiter = new RateLimiter(_delayFn);
+  }
 
   async translate(
     keys: Record<string, string>,
@@ -37,13 +48,17 @@ export class AnthropicProvider implements TranslationProvider {
       JSON.stringify(keys, null, 2);
 
     const callApi = async (): Promise<string> => {
-      const response = await client.messages.create({
-        model: this.config.model,
-        max_tokens: 8192,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userMessage }],
-      });
-      const block = response.content[0];
+      await this._rateLimiter.throttle();
+      const { data: message, response: httpResponse } = await client.messages
+        .create({
+          model: this.config.model,
+          max_tokens: 8192,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userMessage }],
+        })
+        .withResponse();
+      this._rateLimiter.update(httpResponse.headers);
+      const block = message.content[0];
       if (block.type !== "text")
         throw new Error("Unexpected response content type from Anthropic");
       return block.text;
@@ -51,7 +66,7 @@ export class AnthropicProvider implements TranslationProvider {
 
     let raw: string;
     try {
-      raw = await callApi();
+      raw = await retryWithBackoff(callApi, { delayFn: this._delayFn });
     } catch (err) {
       throw new Error(
         `Anthropic API call failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -68,7 +83,7 @@ export class AnthropicProvider implements TranslationProvider {
       );
       let raw2: string;
       try {
-        raw2 = await callApi();
+        raw2 = await retryWithBackoff(callApi, { delayFn: this._delayFn });
       } catch (err) {
         throw new Error(
           `Anthropic API call failed on retry: ${err instanceof Error ? err.message : String(err)}`,
