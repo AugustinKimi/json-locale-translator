@@ -16,6 +16,8 @@
  *            reset value is an ISO-8601 datetime string
  */
 
+import { diag } from "./reporter.js";
+
 export interface RateLimitState {
   requestsLimit: number | null;
   requestsRemaining: number | null;
@@ -180,9 +182,7 @@ export class RateLimiter {
 
     if (delay >= MIN_THROTTLE_MS) {
       const secs = (delay / 1000).toFixed(1);
-      process.stderr.write(
-        `[info] Throttling: waiting ${secs}s to stay within rate limits\n`,
-      );
+      diag.info(`Throttling: waiting ${secs}s to stay within rate limits`);
       await this._delayFn(delay);
     }
   }

@@ -3,6 +3,7 @@ import type { ProviderConfig } from "./base.js";
 import { retryWithBackoff } from "../retry.js";
 import type { RetryOptions } from "../retry.js";
 import { RateLimiter } from "../rate-limiter.js";
+import { diag } from "../reporter.js";
 
 /** Strip optional markdown code-fence wrapper the model sometimes adds. */
 function extractJson(raw: string): string {
@@ -78,9 +79,7 @@ export class AnthropicProvider implements TranslationProvider {
       parsed = JSON.parse(extractJson(raw));
     } catch {
       // Retry once
-      process.stderr.write(
-        `[warn] Failed to parse Anthropic response as JSON, retrying...\n`,
-      );
+      diag.warn(`Failed to parse Anthropic response as JSON, retrying...`);
       let raw2: string;
       try {
         raw2 = await retryWithBackoff(callApi, { delayFn: this._delayFn });
@@ -103,8 +102,8 @@ export class AnthropicProvider implements TranslationProvider {
       if (key in parsed) {
         result[key] = String(parsed[key]);
       } else {
-        process.stderr.write(
-          `[warn] Missing key "${key}" in Anthropic translation response, keeping original value\n`,
+        diag.warn(
+          `Missing key "${key}" in Anthropic translation response, keeping original value`,
         );
         result[key] = originalValue;
       }

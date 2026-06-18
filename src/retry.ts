@@ -1,3 +1,5 @@
+import { diag } from "./reporter.js";
+
 const defaultDelay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -87,9 +89,7 @@ export async function retryWithBackoff<T>(
           status === 429
             ? `Rate limit reached — waiting ${(delay / 1000).toFixed(1)}s for the limit to reset`
             : `API error (${status ?? "network"}) — retrying in ${(delay / 1000).toFixed(1)}s`;
-        process.stderr.write(
-          `[warn] ${label} (attempt ${attempt + 1}/${maxAttempts})...\n`,
-        );
+        diag.warn(`${label} (attempt ${attempt + 1}/${maxAttempts})...`);
         await delayFn(delay);
       } else {
         throw err;

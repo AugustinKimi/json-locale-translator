@@ -19,7 +19,17 @@ import {
   placeholdersMatch,
 } from "./placeholders.js";
 import { basename, join } from "node:path";
-import type { TranslatorConfig, TranslationResult } from "./config.js";
+import type {
+  TranslatorConfig,
+  TranslationResult,
+  TranslationError,
+} from "./config.js";
+import {
+  diag,
+  noopReporter,
+  type Reporter,
+  type TranslationPlan,
+} from "./reporter.js";
 
 interface PlaceholderWarning {
   relFile: string;
@@ -32,6 +42,7 @@ interface FileResult {
   cached: number;
   pruned: number;
   warnings: PlaceholderWarning[];
+  outputPath: string;
 }
 
 interface LocaleResult {
@@ -39,6 +50,20 @@ interface LocaleResult {
   cached: number;
   pruned: number;
   warnings: PlaceholderWarning[];
+  errors: TranslationError[];
+}
+
+/**
+ * Resolve the display label for the source language. An explicit
+ * `input.locale` always wins (including `""` to hide the label); otherwise it
+ * is best-effort derived from the input path's basename.
+ */
+function resolveSourceLabel(
+  configured: string | undefined,
+  inputPath: string,
+): string {
+  if (configured !== undefined) return configured;
+  return basename(inputPath).replace(/\.json$/i, "");
 }
 
 /** A unique translation request, deduped by cache key within a single file. */
@@ -108,8 +133,8 @@ async function translateRequests(
         // Keep the original source value rather than ship mangled placeholders.
         byCacheKey.set(req.ck, req.source);
         warnings.push({ relFile, pathKey: req.pathKey, source: req.source });
-        process.stderr.write(
-          `[warn] ${locale} / ${relFile} :: ${req.pathKey}: placeholder mismatch after retry — keeping original value\n`,
+        diag.warn(
+          `${locale} / ${relFile} :: ${req.pathKey}: placeholder mismatch after retry — keeping original value`,
         );
       }
     }
@@ -132,6 +157,7 @@ async function processFile(
   relFile: string,
   cacheEntries: Record<string, string>,
   seenCacheKeys: Set<string>,
+  reporter: Reporter,
 ): Promise<FileResult> {
   const { cache: useCache, cacheKeying, dryRun } = config.options;
 
@@ -169,9 +195,12 @@ async function processFile(
     setAtPath(clone, leaf.path, cacheEntries[ckOf(leaf)]);
   }
 
-  process.stderr.write(
-    `[info] ${locale} / ${relFile}: ${cachedLeaves.length} cached, ${uniqueRequests.size} to translate\n`,
-  );
+  reporter.fileStart({
+    locale,
+    relFile,
+    cached: cachedLeaves.length,
+    toTranslate: uniqueRequests.size,
+  });
 
   const warnings: PlaceholderWarning[] = [];
 
@@ -197,10 +226,13 @@ async function processFile(
   }
 
   if (dryRun) {
-    process.stderr.write(
-      `[dry-run] Would write ${leaves.length} string leaves to ${outputFilePath}\n`,
-    );
-    return { translated: 0, cached: cachedLeaves.length, pruned: 0, warnings };
+    return {
+      translated: uncachedLeaves.length,
+      cached: cachedLeaves.length,
+      pruned: 0,
+      warnings,
+      outputPath: outputFilePath,
+    };
   }
 
   let finalData: unknown = clone;
@@ -224,6 +256,7 @@ async function processFile(
     cached: cachedLeaves.length,
     pruned,
     warnings,
+    outputPath: outputFilePath,
   };
 }
 
@@ -233,6 +266,7 @@ async function runLocale(
   config: TranslatorConfig,
   locale: string,
   files: Array<{ input: string; output: string; relFile: string }>,
+  reporter: Reporter,
 ): Promise<LocaleResult> {
   let systemPrompt = config.prompt.system.replace("{locale}", locale);
   if (config.prompt.overrides?.[locale]) {
@@ -248,13 +282,13 @@ async function runLocale(
     );
     cacheEntries = loaded.entries;
     if (loaded.legacy) {
-      process.stderr.write(
-        `[notice] ${locale}: legacy cache format detected and ignored. Run \`json-translate adopt\` to rebuild from existing translations.\n`,
+      reporter.notice(
+        `${locale}: legacy cache format detected and ignored. Run \`json-translate adopt\` to rebuild from existing translations.`,
       );
     }
     if (loaded.modelChanged) {
-      process.stderr.write(
-        `[notice] ${locale}: cache was built with a different model — invalidated.\n`,
+      reporter.notice(
+        `${locale}: cache was built with a different model — invalidated.`,
       );
     }
   }
@@ -264,23 +298,42 @@ async function runLocale(
   let cached = 0;
   let pruned = 0;
   const warnings: PlaceholderWarning[] = [];
+  const errors: TranslationError[] = [];
 
   for (const file of files) {
-    const res = await processFile(
-      provider,
-      config,
-      locale,
-      systemPrompt,
-      file.input,
-      file.output,
-      file.relFile,
-      cacheEntries,
-      seenCacheKeys,
-    );
-    translated += res.translated;
-    cached += res.cached;
-    pruned += res.pruned;
-    warnings.push(...res.warnings);
+    // A single bad file (read/parse/API/write failure) must never abort the
+    // whole run — collect the error, report it, and move on to the next file.
+    try {
+      const res = await processFile(
+        provider,
+        config,
+        locale,
+        systemPrompt,
+        file.input,
+        file.output,
+        file.relFile,
+        cacheEntries,
+        seenCacheKeys,
+        reporter,
+      );
+      translated += res.translated;
+      cached += res.cached;
+      pruned += res.pruned;
+      warnings.push(...res.warnings);
+      reporter.fileDone({
+        locale,
+        relFile: file.relFile,
+        outputPath: res.outputPath,
+        translated: res.translated,
+        cached: res.cached,
+        warnings: res.warnings.length,
+        pruned: res.pruned,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      errors.push({ locale, relFile: file.relFile, message });
+      reporter.fileError({ locale, relFile: file.relFile, message });
+    }
   }
 
   if (config.options.cache && !config.options.dryRun) {
@@ -298,11 +351,31 @@ async function runLocale(
     );
   }
 
-  return { translated, cached, pruned, warnings };
+  return { translated, cached, pruned, warnings, errors };
+}
+
+/**
+ * Sum the translatable string leaves across a set of source files for the plan
+ * estimate. Unreadable/malformed files are skipped here — they surface as
+ * collected per-file errors during the resilient processing loop, and must not
+ * abort the run before it starts.
+ */
+async function countKeys(filePaths: string[]): Promise<number> {
+  let total = 0;
+  for (const filePath of filePaths) {
+    try {
+      const source = await readJsonFile(filePath);
+      total += collectStringLeaves(source).length;
+    } catch {
+      // Ignore — reported later by processFile.
+    }
+  }
+  return total;
 }
 
 export async function translate(
   config: TranslatorConfig,
+  reporter: Reporter = noopReporter,
 ): Promise<TranslationResult[]> {
   const provider = await createProvider(config.provider);
 
@@ -312,6 +385,20 @@ export async function translate(
     const outputBaseDir = config.output.baseDir!;
     const relativeFiles = await walkJsonFiles(inputBaseDir);
 
+    const plan: TranslationPlan = {
+      mode: "folder",
+      sourceLabel: resolveSourceLabel(config.input.locale, inputBaseDir),
+      sourcePath: inputBaseDir,
+      locales: config.locales,
+      fileCount: relativeFiles.length,
+      totalKeys: await countKeys(
+        relativeFiles.map((rel) => join(inputBaseDir, rel)),
+      ),
+      totalUnits: relativeFiles.length * config.locales.length,
+      dryRun: config.options.dryRun,
+    };
+    reporter.start(plan);
+
     const tasks = config.locales.map(
       (locale) => async (): Promise<TranslationResult> => {
         const files = relativeFiles.map((rel) => ({
@@ -319,7 +406,7 @@ export async function translate(
           output: join(outputBaseDir, locale, rel),
           relFile: rel,
         }));
-        const res = await runLocale(provider, config, locale, files);
+        const res = await runLocale(provider, config, locale, files, reporter);
         return {
           locale,
           keysTranslated: res.translated,
@@ -329,6 +416,7 @@ export async function translate(
           dryRun: config.options.dryRun,
           placeholderWarnings: res.warnings.length,
           prunedKeys: res.pruned,
+          errors: res.errors,
         };
       },
     );
@@ -340,13 +428,29 @@ export async function translate(
   const base = config.input.base!;
   const relFile = basename(base);
 
+  const plan: TranslationPlan = {
+    mode: "single-file",
+    sourceLabel: resolveSourceLabel(config.input.locale, base),
+    sourcePath: base,
+    locales: config.locales,
+    fileCount: 1,
+    totalKeys: await countKeys([base]),
+    totalUnits: config.locales.length,
+    dryRun: config.options.dryRun,
+  };
+  reporter.start(plan);
+
   const tasks = config.locales.map(
     (locale) => async (): Promise<TranslationResult> => {
       const filename = config.output.filename.replace("{locale}", locale);
       const outputPath = join(config.output.dir!, filename);
-      const res = await runLocale(provider, config, locale, [
-        { input: base, output: outputPath, relFile },
-      ]);
+      const res = await runLocale(
+        provider,
+        config,
+        locale,
+        [{ input: base, output: outputPath, relFile }],
+        reporter,
+      );
       return {
         locale,
         keysTranslated: res.translated,
@@ -355,6 +459,7 @@ export async function translate(
         dryRun: config.options.dryRun,
         placeholderWarnings: res.warnings.length,
         prunedKeys: res.pruned,
+        errors: res.errors,
       };
     },
   );

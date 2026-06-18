@@ -20,6 +20,15 @@ const ConfigSchema = z.object({
     .object({
       base: z.string().optional(),
       baseDir: z.string().optional(),
+      /**
+       * Label for the source language, used purely for display
+       * (e.g. the "en → fr" progress text). Optional and free-form:
+       *   - omit it      → auto-derived from the input path's basename
+       *   - set "en"     → shown verbatim
+       *   - set ""       → no source label is shown ("→ fr")
+       * Overridable per-run with the `--source` CLI flag.
+       */
+      locale: z.string().optional(),
     })
     .refine((v) => v.base || v.baseDir, {
       message:
@@ -69,6 +78,13 @@ const ConfigSchema = z.object({
 
 export type TranslatorConfig = z.infer<typeof ConfigSchema>;
 
+/** A single source file that failed during a locale's run. */
+export interface TranslationError {
+  locale: string;
+  relFile: string;
+  message: string;
+}
+
 export interface TranslationResult {
   locale: string;
   keysTranslated: number;
@@ -80,6 +96,8 @@ export interface TranslationResult {
   placeholderWarnings?: number;
   /** Keys removed from target files when `options.prune` is enabled. */
   prunedKeys?: number;
+  /** Files that failed for this locale; the run continued past them. */
+  errors?: TranslationError[];
 }
 
 export interface AdoptLocaleResult {
