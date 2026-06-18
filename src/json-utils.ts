@@ -56,9 +56,11 @@ export async function readJsonFile(
 export async function writeJsonFile(
   filePath: string,
   data: unknown,
+  indent = 2,
 ): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  // Always end with a single trailing newline (Prettier/most repos expect it).
+  await writeFile(filePath, JSON.stringify(data, null, indent) + "\n", "utf-8");
 }
 
 export function mergeJson(

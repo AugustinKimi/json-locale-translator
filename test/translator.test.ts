@@ -45,6 +45,9 @@ function baseOptions(tmpDir: string) {
     cache: false,
     cacheDir: join(tmpDir, ".cache"),
     dryRun: false,
+    cacheKeying: "source" as const,
+    prune: false,
+    indent: 2,
   };
 }
 

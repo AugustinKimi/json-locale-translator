@@ -47,6 +47,22 @@ const ConfigSchema = z.object({
       cache: z.boolean().default(true),
       cacheDir: z.string().default(".translator-cache"),
       dryRun: z.boolean().default(false),
+      /**
+       * How cache entries are keyed.
+       * - 'source' (default): dedupe identical strings app-wide (cheapest).
+       * - 'path': key by `<relFile>#<path>` so the same source string can have
+       *   different, context-specific translations in different places.
+       */
+      cacheKeying: z.enum(["source", "path"]).default("source"),
+      /** Remove target keys (and stale cache entries) no longer present in source. */
+      prune: z.boolean().default(false),
+      /** Indentation width for written JSON files. */
+      indent: z.number().int().min(0).max(8).default(2),
+      /**
+       * Regex strings used to detect interpolation tokens that must round-trip
+       * unchanged. Defaults to {{name}}, {name}, %s/%d/%1$s and <tag> markers.
+       */
+      placeholderPatterns: z.array(z.string()).optional(),
     })
     .default({}),
 });
@@ -60,7 +76,24 @@ export interface TranslationResult {
   outputPath: string;
   filesTranslated?: number;
   dryRun: boolean;
+  /** Leaves whose placeholders could not be preserved (original kept). */
+  placeholderWarnings?: number;
+  /** Keys removed from target files when `options.prune` is enabled. */
+  prunedKeys?: number;
 }
+
+export interface AdoptLocaleResult {
+  locale: string;
+  /** Cache entries seeded from existing translations. */
+  seeded: number;
+  /** Source leaves with no existing target translation (will translate next run). */
+  missing: number;
+  /** Target-only string leaves with no matching source path (orphans). */
+  orphans: number;
+  filesProcessed: number;
+}
+
+export type AdoptResult = AdoptLocaleResult[];
 
 export { ConfigSchema };
 

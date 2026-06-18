@@ -19,6 +19,10 @@ Works as a **CLI tool** and as a **Node.js library**.
 - [Providers](#providers)
 - [Prompt Customisation](#prompt-customisation)
 - [Caching](#caching)
+- [Migrating an existing i18n project](#migrating-an-existing-i18n-project)
+- [Structure Preservation](#structure-preservation)
+- [Placeholder Integrity](#placeholder-integrity)
+- [Prune](#prune)
 - [Merge Mode](#merge-mode)
 - [Dry Run](#dry-run)
 - [Programmatic Usage](#programmatic-usage)
@@ -186,11 +190,15 @@ At least one of `dir` or `baseDir` must be set.
 
 | Field         | Type      | Default             | Description                                               |
 | ------------- | --------- | ------------------- | --------------------------------------------------------- |
-| `batchSize`   | `number`  | `20`                | Number of keys sent per API request (1–100)               |
-| `concurrency` | `number`  | `3`                 | Maximum parallel locale tasks (1–10)                      |
-| `cache`       | `boolean` | `true`              | Cache translations to avoid re-translating unchanged keys |
-| `cacheDir`    | `string`  | `.translator-cache` | Directory where cache files are stored                    |
-| `dryRun`      | `boolean` | `false`             | Preview what would be written without touching any files  |
+| `batchSize`           | `number`              | `20`                | Number of keys sent per API request (1–100)                                                          |
+| `concurrency`         | `number`              | `3`                 | Maximum parallel locale tasks (1–10)                                                                 |
+| `cache`               | `boolean`             | `true`              | Cache translations to avoid re-translating unchanged keys                                            |
+| `cacheDir`            | `string`              | `.translator-cache` | Directory where cache files are stored                                                               |
+| `cacheKeying`         | `'source' \| 'path'`  | `'source'`          | `'source'` dedupes identical strings app-wide; `'path'` keys by `<relFile>#<path>` for context-specific translations |
+| `prune`               | `boolean`             | `false`             | Remove target keys (and stale cache entries) no longer present in the source                         |
+| `indent`              | `number`              | `2`                 | Indentation width for written JSON files (files always end in one `\n`)                              |
+| `placeholderPatterns` | `string[]`            | _(sensible defaults)_ | Regex strings for interpolation tokens that must round-trip unchanged                              |
+| `dryRun`              | `boolean`             | `false`             | Preview what would be written without touching any files                                             |
 
 ---
 
@@ -204,14 +212,14 @@ Set `input.base` to a single JSON file. For each locale, one output file is prod
 locales/en.json  →  locales/fr.json, locales/de.json, …
 ```
 
-Nested JSON is fully supported. Keys are flattened internally for translation and then restored to their original nesting structure before writing.
+Nested JSON, arrays (including arrays of objects), and non-string values are fully supported — see [Structure Preservation](#structure-preservation). Only string leaves are translated; everything else round-trips untouched.
 
 ### Folder mode
 
 Set `input.baseDir` to the directory of your source locale. Every `.json` file inside that directory (recursively) is translated and written under `output.baseDir/{locale}/`, mirroring the exact same relative path.
 
 - Sub-directories are created automatically.
-- Caching works the same way — each key is cached by its hash so unchanged strings are skipped across subsequent runs even when they appear in different files.
+- Caching works the same way — entries are shared per locale across files (see [Cache keying](#cache-keying)), so unchanged strings are skipped across subsequent runs.
 - `output.merge: true` works per file — existing translated files are merged individually.
 
 ---
@@ -219,13 +227,20 @@ Set `input.baseDir` to the directory of your source locale. Every `.json` file i
 ## CLI Usage
 
 ```
-npx json-translate [options]
+npx json-translate [command] [options]
 ```
+
+| Command   | Description                                                                                          |
+| --------- | --------------------------------------------------------------------------------------------------- |
+| (default) | Translate the configured source into the target locales                                             |
+| `adopt`   | Seed the cache from existing translated files (no API calls) — see [Migrating an existing i18n project](#migrating-an-existing-i18n-project) |
 
 | Option            | Description                                                                                                     |
 | ----------------- | --------------------------------------------------------------------------------------------------------------- |
 | `--config <path>` | Path to a config file. Defaults to auto-detecting `translator.config.ts / .js / .json` in the current directory |
 | `--locale <list>` | Comma-separated locale list, overrides `locales` in config (e.g. `--locale fr,de`)                              |
+| `--adopt`         | Run `adopt` instead of translating (same as the `adopt` command)                                                |
+| `--prune`         | Remove target keys / cache entries no longer present in the source                                              |
 | `--dry-run`       | Preview output paths and key counts without writing any files                                                   |
 | `--help`          | Print usage                                                                                                     |
 | `--version`       | Print package version                                                                                           |
@@ -328,19 +343,30 @@ The override text is appended to the system prompt (separated by a newline) only
 
 ## Caching
 
-Translations are cached in `<cacheDir>/<locale>.json` (default: `.translator-cache/fr.json`, etc.).
+Translations are cached in `<cacheDir>/<locale>.json` (default: `.translator-cache/fr.json`, etc.) in a **human-readable, diffable** format:
 
-Each cache entry is keyed by a SHA-256 hash of:
+```json
+{
+  "_model": "gpt-4o",
+  "entries": {
+    "Hello": "Bonjour",
+    "Goodbye": "Au revoir"
+  }
+}
+```
 
-- the **source string value**
-- the **target locale**
-- the **model name**
+- Entries are reviewable in PRs and **hand-editable** — fix a translation directly in the cache and it will be used on the next run.
+- The whole file is invalidated automatically when `_model` differs from the configured model.
+- Unchanged keys are never sent to the AI again; only modified or new keys consume API credits.
 
-This means:
+### Cache keying
 
-- Unchanged keys are never sent to the AI again.
-- Changing the model or locale automatically invalidates cached entries.
-- Only modified or new keys consume API credits on subsequent runs.
+`options.cacheKeying` controls how entries are keyed:
+
+- **`'source'`** (default) — keyed by the source string, so identical strings are deduped app-wide. Editing a source string changes its key and triggers re-translation.
+- **`'path'`** — keyed by `<relFile>#<dotted.path>`, so the **same English string can have different, context-specific translations** in different places (e.g. `"Open"` → `"Ouvrir"` for a button but `"Ouvert"` for a status). Because path-mode keys are location-based, editing a source string in place is not auto-detected — clear the cache or use `--prune` to refresh.
+
+> **Upgrading from < 0.3.0?** The old opaque `{ <hash>: translation }` cache cannot be migrated losslessly. It is detected and ignored on first run with a notice. Run `json-translate adopt` once to rebuild it from your existing translations — see below.
 
 **Disable caching:**
 
@@ -355,6 +381,91 @@ options: {
 ```bash
 rm -rf .translator-cache
 ```
+
+---
+
+## Migrating an existing i18n project
+
+If your repo **already has translated locale files**, you don't want the tool to
+re-translate everything (cost) or overwrite good translations. The `adopt`
+command bootstraps the cache from what you already have, so a normal run then
+only fills genuinely new or changed keys.
+
+```bash
+# 1. Seed the cache from existing translations — makes NO API calls.
+npx json-translate adopt
+
+# 2. Translate — only new/changed keys hit the API.
+npx json-translate
+```
+
+`adopt` walks the source tree and each existing target file in parallel; for
+every source string whose path already holds a string in the target, it writes
+that pair into the cache. It reports, per locale:
+
+```
+✓ fr  →  412 seeded, 8 to translate, 3 orphan(s)  (12 files)
+```
+
+- **seeded** — entries written to the cache from existing translations.
+- **to translate** — source strings with no existing translation (filled on the next run).
+- **orphan(s)** — keys present only in the target file (removable with `--prune`).
+
+No hand-written migration script required.
+
+---
+
+## Structure Preservation
+
+Source files are translated by walking the JSON tree and replacing **only string
+leaves**, then writing the result back into a deep clone of the source. This means:
+
+- Arrays of strings, **arrays of objects**, and nested arrays are translated in place.
+- Numeric-keyed objects (`{"0": …}`) stay objects; real arrays stay arrays.
+- Numbers, booleans, `null`, and empty/whitespace-only strings are preserved verbatim and never sent to the API.
+- Key order and overall shape are byte-identical except for translated strings.
+
+```jsonc
+// en/seo.json
+{ "sections": [ { "title": "Welcome", "content": "..." } ], "maxItems": 10 }
+
+// fr/seo.json — structure intact, only strings translated
+{ "sections": [ { "title": "Bienvenue", "content": "..." } ], "maxItems": 10 }
+```
+
+---
+
+## Placeholder Integrity
+
+Interpolation tokens must survive translation. After each leaf is translated, the
+**multiset of placeholders** is compared between source and translation. The
+defaults detect `{{name}}`, `{name}`, `%s` / `%d` / `%1$s`, and `<tag>` markers.
+
+On mismatch the leaf is retried once; if it still fails, the **original source
+value is kept**, a `[warn]` is logged, and it is counted in the run summary
+(`placeholderWarnings`). Customise the token set with regex strings:
+
+```ts
+options: {
+  placeholderPatterns: ["\\{\\{[^{}]+\\}\\}", ":[a-z_]+"], // {{x}} and :token
+}
+```
+
+---
+
+## Prune
+
+By default, `merge` keeps target keys that no longer exist in the source. Set
+`options.prune: true` (or pass `--prune`) to remove those orphans and evict their
+stale cache entries:
+
+```ts
+options: {
+  prune: true;
+}
+```
+
+It is `false` by default to stay safe.
 
 ---
 
@@ -412,6 +523,31 @@ interface TranslationResult {
   outputPath: string; // output file path (single-file) or directory (folder mode)
   filesTranslated?: number; // number of files processed (folder mode only)
   dryRun: boolean;
+  placeholderWarnings?: number; // leaves whose placeholders could not be preserved
+  prunedKeys?: number; // keys removed when prune is enabled
+}
+```
+
+### `adopt`
+
+```ts
+import { adopt, loadConfig } from "jsonai-translator";
+
+const config = await loadConfig();
+const results = await adopt(config); // seeds the cache, no API calls
+
+for (const r of results) {
+  console.log(`${r.locale}: ${r.seeded} seeded, ${r.missing} to translate, ${r.orphans} orphans`);
+}
+```
+
+```ts
+interface AdoptLocaleResult {
+  locale: string;
+  seeded: number; // cache entries seeded from existing translations
+  missing: number; // source leaves with no existing translation
+  orphans: number; // target-only keys (removable with prune)
+  filesProcessed: number;
 }
 ```
 
@@ -446,6 +582,10 @@ export default defineConfig({
     concurrency: 5,
     cache: true,
     cacheDir: ".translator-cache",
+    cacheKeying: "source", // or 'path' for context-specific translations
+    prune: false,
+    indent: 2,
+    // placeholderPatterns: ["\\{\\{[^{}]+\\}\\}", "\\{[^{}]+\\}"],
     dryRun: false,
   },
 });
